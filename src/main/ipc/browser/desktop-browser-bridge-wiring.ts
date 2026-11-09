@@ -47,12 +47,12 @@ import {
 import { markRemoteCliDrivenWorkspace } from '../../browser/desktop-browser-bridge/remote-cli-driven-workspaces'
 import { persistedStore } from '../ssh/ssh-ipc-context'
 import { localSshBrowserTargetIdForSession } from '../../browser/routing/local-host-partitions/local-ssh-browser-partitions'
+import { browserSessionRegistry } from '../../browser/sessions/profiles/browser-session-registry'
 
 const ATTACH_TIMEOUT_MS = 15_000
 const BRIDGE_CLIENT_ID = randomUUID()
 
 let manager: DesktopBrowserBridgeManager | null = null
-let stopWatchingRoutingSettings: (() => void) | null = null
 
 function log(message: string): void {
   console.info(`[desktop-browser-bridge] ${message}`)
@@ -75,10 +75,6 @@ export function listDesktopBrowserBridgeCandidates(
     // Only managed hosts qualify even when the global switch defaults on.
     const environmentId = getManagedOrcadFenceEnvironmentId(target)
     if (!environmentId || isRuntimeEnvironmentManuallyDisconnected(environmentId)) {
-      continue
-    }
-    // Detached routing must not retain desktop egress authority.
-    if (!isSshTargetBrowsingRouted(target.id)) {
       continue
     }
     try {
@@ -176,13 +172,13 @@ export function installDesktopBrowserBridge(options: {
             markRemoteCliDrivenWorkspace(workspaceId)
             noticeDesktopBrowserBridgeHostControl(candidate, getMainWindow, hostControlDeps())
           },
-          isHostBrowsingRouted: () => isSshTargetBrowsingRouted(candidate.targetId),
-          isGuestRoutedThroughHost: (webContentsId) => {
+          isGuestAccessible: (webContentsId) => {
             const guest = webContents.fromId(webContentsId)
             return Boolean(
               guest &&
               !guest.isDestroyed() &&
-              localSshBrowserTargetIdForSession(guest.session) === candidate.targetId &&
+              (localSshBrowserTargetIdForSession(guest.session) === candidate.targetId ||
+                browserSessionRegistry.profileIdForSession(guest.session) !== null) &&
               isHostReachableDocument(guest.getURL())
             )
           },
@@ -201,17 +197,6 @@ export function installDesktopBrowserBridge(options: {
       ),
     log
   })
-  // Routing changes must immediately detach hosts and cancel pending commands.
-  stopWatchingRoutingSettings?.()
-  stopWatchingRoutingSettings =
-    persistedStore?.onSettingsChanged?.((updates) => {
-      if (
-        'browserSshWorkspaceRoutingEnabled' in updates ||
-        'browserSshWorkspaceRoutingDisabledTargetIds' in updates
-      ) {
-        manager?.reconcile()
-      }
-    }) ?? null
   setDesktopBrowserBridgeControl({
     reconcile: () => manager?.reconcile(),
     resetEnvironment: (environmentId) => manager?.resetEnvironment(environmentId)
@@ -219,17 +204,7 @@ export function installDesktopBrowserBridge(options: {
   manager.reconcile()
 }
 
-function isSshTargetBrowsingRouted(targetId: string): boolean {
-  const settings = persistedStore?.getSettings()
-  return (
-    settings?.browserSshWorkspaceRoutingEnabled !== false &&
-    !settings?.browserSshWorkspaceRoutingDisabledTargetIds?.includes(targetId)
-  )
-}
-
 export function disposeDesktopBrowserBridge(): void {
-  stopWatchingRoutingSettings?.()
-  stopWatchingRoutingSettings = null
   setDesktopBrowserBridgeControl(null)
   manager?.dispose()
   manager = null

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { DesktopBrowserBridgeRequest } from '../../../shared/desktop-browser-bridge-protocol'
-import { resolveRemoteCliBrowserScopeSelector } from '../../runtime/desktop-browser-bridge/remote-cli-browser-scope'
+import {
+  assertRemoteCliBrowserAccess,
+  resolveRemoteCliBrowserScopeSelector
+} from '../../runtime/desktop-browser-bridge/remote-cli-browser-scope'
 import {
   executeDesktopBrowserBridgeRequest,
   type DesktopBrowserBridgeAuditEntry,
@@ -56,8 +59,7 @@ function deps(overrides: Partial<DesktopBrowserBridgeExecutorDeps> = {}) {
     resolveWorkspace: rendererScope,
     worktreeIdForPage: (page) => MOUNTED_PAGE_OWNERS[page] ?? null,
     markWorkspaceDriven: (workspaceId) => driven.push(workspaceId),
-    isHostBrowsingRouted: () => true,
-    isGuestRoutedThroughHost: () => true,
+    isGuestAccessible: () => true,
     dispatch: async (method, params) => {
       const scopeProbe = await resolveRemoteCliBrowserScopeSelector(`id:${LOCAL_WORKSPACE}`)?.catch(
         (error: Error) => error.message
@@ -72,6 +74,54 @@ function deps(overrides: Partial<DesktopBrowserBridgeExecutorDeps> = {}) {
 }
 
 describe('executeDesktopBrowserBridgeRequest', () => {
+  it('controls a desktop browser page within the host workspace without requiring SSH egress', async () => {
+    const { value } = deps({
+      dispatch: async () => {
+        assertRemoteCliBrowserAccess(41)
+        return { id: 'x', ok: true, result: { text: 'lane-blue' }, _meta: { runtimeId: 'desktop' } }
+      }
+    })
+
+    const outcome = await executeDesktopBrowserBridgeRequest(
+      request({ workspaceId: HOST_WORKSPACE, params: { page: 'host-page' } }),
+      value
+    )
+
+    expect(outcome).toEqual({ ok: true, result: { text: 'lane-blue' } })
+  })
+
+  it('keeps desktop workspaces outside the SSH host scope', async () => {
+    const { value, dispatched } = deps()
+
+    const outcome = await executeDesktopBrowserBridgeRequest(
+      request({ workspaceId: LOCAL_WORKSPACE, params: { page: 'local-page' } }),
+      value
+    )
+
+    expect(outcome).toMatchObject({ ok: false, error: { code: 'browser_tab_not_found' } })
+    expect(dispatched).toEqual([])
+  })
+
+  it('rechecks page access when an admitted page becomes unavailable', async () => {
+    let accessible = true
+    const { value } = deps({
+      isGuestAccessible: () => accessible,
+      dispatch: async () => {
+        assertRemoteCliBrowserAccess(41)
+        accessible = false
+        assertRemoteCliBrowserAccess(41)
+        return { id: 'x', ok: true, result: 'unreachable', _meta: { runtimeId: 'desktop' } }
+      }
+    })
+
+    const outcome = await executeDesktopBrowserBridgeRequest(
+      request({ workspaceId: HOST_WORKSPACE, params: { page: 'host-page' } }),
+      value
+    )
+
+    expect(outcome.ok).toBe(false)
+  })
+
   it('never runs a command whose bridge was revoked while its scope was being checked', async () => {
     const revoked = new AbortController()
     const { value, dispatched } = deps({

@@ -1,11 +1,8 @@
 // Audit outcomes and URL origins only; request parameters can contain secrets.
 import {
   DESKTOP_BROWSER_BRIDGE_NOT_FORWARDED_CODE,
-  DESKTOP_BROWSER_BRIDGE_ROUTING_OPT_OUT_LABEL,
-  DESKTOP_BROWSER_BRIDGE_ROUTING_SETTING_LABEL,
   DESKTOP_BROWSER_BRIDGE_SCOPE_CODE,
   DESKTOP_BROWSER_BRIDGE_UNAVAILABLE_CODE,
-  DESKTOP_BROWSER_BRIDGE_UNROUTED_CODE,
   isDesktopBrowserBridgeMethod,
   type DesktopBrowserBridgeRequest
 } from '../../../shared/desktop-browser-bridge-protocol'
@@ -41,9 +38,8 @@ export type DesktopBrowserBridgeExecutorDeps = {
   worktreeIdForPage(browserPageId: string): string | null
   /** Host-driven workspaces lose programmatic clipboard reads. */
   markWorkspaceDriven(workspaceId: string): void
-  isHostBrowsingRouted(): boolean
-  /** Requires this host's prepared SSH route partition. */
-  isGuestRoutedThroughHost(webContentsId: number): boolean
+  /** A supported browser session showing a host-reachable document. */
+  isGuestAccessible(webContentsId: number): boolean
   dispatch(method: string, params: Record<string, unknown>): Promise<RpcResponse>
   audit(entry: DesktopBrowserBridgeAuditEntry): void
 }
@@ -98,8 +94,7 @@ export async function executeDesktopBrowserBridgeRequest(
       workspaceId,
       () => deps.dispatch(request.method, params),
       signal,
-      (webContentsId) =>
-        deps.isHostBrowsingRouted() && deps.isGuestRoutedThroughHost(webContentsId),
+      (webContentsId) => deps.isGuestAccessible(webContentsId),
       hostRevoked,
       { targetId: deps.targetId, hostLabel: deps.hostLabel }
     )
@@ -129,13 +124,6 @@ async function scopeRequest(
     throw new BridgeRefusal(
       DESKTOP_BROWSER_BRIDGE_NOT_FORWARDED_CODE,
       `${request.method} cannot run on this desktop from an SSH host.`
-    )
-  }
-  // Unrouted pages could expose the desktop's loopback and LAN to the host.
-  if (!deps.isHostBrowsingRouted()) {
-    throw new BridgeRefusal(
-      DESKTOP_BROWSER_BRIDGE_UNROUTED_CODE,
-      `This host's browser tabs browse from your desktop's own network, so its orca CLI cannot use them. Set ${DESKTOP_BROWSER_BRIDGE_ROUTING_SETTING_LABEL} to "SSH host" and, if this host is listed under "${DESKTOP_BROWSER_BRIDGE_ROUTING_OPT_OUT_LABEL}", click "Use SSH host".`
     )
   }
   const params: Record<string, unknown> = { ...request.params }

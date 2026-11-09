@@ -1,0 +1,174 @@
+name: Fork macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Mac architecture to package
+        type: choice
+        default: both
+        options: [both, arm64, x64]
+  push:
+    branches: [codex/ssh-browser-device-control]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORCA_BACKGROUND_LAUNCH: '1'
+
+jobs:
+  prepare:
+    if: github.repository == 'Gwen0x4c3/orca' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      matrix: ${{ steps.identity.outputs.matrix }}
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+      - name: Select standard runners and build identity
+        id: identity
+        env:
+          ARCHITECTURE: ${{ inputs.architecture || 'both' }}
+        run: |
+          node <<'NODE'
+          const { appendFileSync } = require('node:fs')
+          const arch = process.env.ARCHITECTURE
+          if (!['both', 'arm64', 'x64'].includes(arch)) throw new Error('Invalid architecture')
+          const include = [
+            { arch: 'arm64', runner: 'macos-15' },
+            { arch: 'x64', runner: 'macos-15-intel' }
+          ].filter((entry) => arch === 'both' || entry.arch === arch)
+          const base = require('./package.json').version.split('-')[0]
+          const version = `${base}-fork.${process.env.GITHUB_RUN_NUMBER}.${process.env.GITHUB_RUN_ATTEMPT}`
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `matrix=${JSON.stringify({ include })}\nversion=${version}\ntag=fork-macos-${process.env.GITHUB_RUN_ID}\n`)
+          NODE
+      - name: Prepare downloadable fork release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          BUILD_VERSION: ${{ steps.identity.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$SOURCE_SHA" --draft --prerelease \
+              --title "Orca fork macOS $BUILD_VERSION" \
+              --notes "Personal fork build from $SOURCE_SHA. Includes desktop-network browser control for SSH workspaces. Apple Silicon: arm64 DMG; Intel: x64 DMG. Ad-hoc signed, not notarized: macOS may require allowing the app in Privacy & Security. SHA-256 files accompany each download."
+          fi
+
+  server-template:
+    needs: prepare
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/qualified-orcad-template.yml
+    with:
+      ref: ${{ github.sha }}
+      fast_runners: false
+
+  build:
+    needs: [prepare, server-template]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      actions: read
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      ORCA_LOCAL_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+      ORCA_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pnpm
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          check-latest: true
+          package-manager-cache: false
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/install-mobile-dependencies
+      - name: Build desktop and native helpers
+        run: pnpm build:release
+      - uses: actions/download-artifact@v8
+        with:
+          name: orcad-template
+          path: out/orcad-template
+      - name: Package a self-contained DMG
+        env:
+          MAC_ARCH: ${{ matrix.arch }}
+          FORK_OWNER: ${{ github.repository_owner }}
+          ORCA_REQUIRE_ORCAD_TEMPLATE: '1'
+        run: |
+          pnpm ensure:electron-runtime
+          pnpm exec electron-builder --config config/electron-builder.config.cjs \
+            --mac dmg "--$MAC_ARCH" --publish never \
+            -c.mac.identity=- -c.publish.owner="$FORK_OWNER" -c.publish.repo=orca
+          test -s "dist/orca-macos-$MAC_ARCH.dmg"
+          cd dist
+          shasum -a 256 "orca-macos-$MAC_ARCH.dmg" > "orca-macos-$MAC_ARCH.dmg.sha256"
+      - name: Upload DMG and checksum to the fork release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          MAC_ARCH: ${{ matrix.arch }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "dist/orca-macos-$MAC_ARCH.dmg" "dist/orca-macos-$MAC_ARCH.dmg.sha256" --clobber
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the downloadable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          gh release view "$RELEASE_TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    if: always() && needs.prepare.result == 'success'
+    needs: [prepare, server-template, build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete temporary Actions artifacts after release upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[].id' | while read -r artifact_id; do
+              gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$artifact_id"
+            done

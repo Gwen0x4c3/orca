@@ -51,11 +51,11 @@ export function captureRemoteCliBrowserRevocation(): (webContentsId?: number) =>
         'The Orca desktop stopped sharing its browser before this command ran.'
       )
     }
-    // Routing may be disabled and the guest remounted while this command queues.
+    // The guest may be remounted or navigate to a local document while this command queues.
     if (webContentsId !== undefined && active?.admitGuest && !active.admitGuest(webContentsId)) {
       throw new BrowserError(
         DESKTOP_BROWSER_BRIDGE_UNROUTED_CODE,
-        "This page is not browsing through the SSH host, so the host's orca CLI cannot use it."
+        "This page is not available to the SSH host's orca CLI."
       )
     }
   }
